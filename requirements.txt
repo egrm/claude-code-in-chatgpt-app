@@ -1,0 +1,6 @@
+claude-agent-sdk==0.2.168
+mcp==2.3.0
+httpx2==2.13.1
+starlette==1.8.0
+uvicorn==0.54.0
+pywin32==312; sys_platform == 'win32'

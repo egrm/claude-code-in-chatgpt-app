@@ -1,0 +1,12 @@
+.venv/
+.runtime/
+.test-tmp*/
+__pycache__/
+.pytest_cache/
+collaboration/
+*.sqlite*
+*.log
+*.jsonl
+.env*
+config*.toml*
+*.backup*
