@@ -1,21 +1,75 @@
-"""STDIO MCP facade. Worker state survives facade/client disconnects."""
+"""STDIO MCP facade. Holds a heartbeat lease on the shared worker while this client is connected;
+when the last client's lease ends the worker interrupts its tasks and exits (see lifecycle.py)."""
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+import os
 import httpx2
 from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
+from lifecycle import HEARTBEAT_S
 from runtime import ensure_worker
 from policy import sanitize_process_environment
 
+UPGRADE = ('The running supervisor worker predates client leases. Finish or stop its active tasks, '
+           'then run: python setup.py install (it upgrades an idle older worker)')
 _transport = None
+_lease = None
+_heartbeat_s = HEARTBEAT_S
+_connecting = None
+
+
+async def _post(method, args, timeout=50, lease=None):
+    body = {'method': method, 'args': args}
+    if lease:
+        body['lease'] = lease
+    async with httpx2.AsyncClient(trust_env=False, timeout=timeout) as client:
+        response = await client.post(f"http://127.0.0.1:{_transport['port']}/rpc",
+            headers={'Authorization': 'Bearer '+_transport['secret']}, json=body)
+    return response.status_code, response.json()
+
+
+async def _connect():
+    """(Re)start or reuse the worker and acquire a fresh client lease."""
+    global _transport, _lease, _heartbeat_s, _connecting
+    if _connecting is None:
+        _connecting = asyncio.Lock()
+    async with _connecting:
+        _lease = None
+        _transport = await asyncio.to_thread(ensure_worker)
+        code, body = await _post('lease_acquire', {'client': f'mcp-facade pid {os.getpid()}'}, timeout=10)
+        if code == 400:
+            raise ValueError(UPGRADE)
+        if code != 200:
+            raise ValueError(body.get('error', f'Worker lease refused ({code})'))
+        _lease = body['result']['lease_id']
+        _heartbeat_s = body['result'].get('heartbeat_s', HEARTBEAT_S)
+
+
+async def _heartbeat():
+    while True:
+        await asyncio.sleep(_heartbeat_s)
+        try:
+            code, _ = await _post('lease_heartbeat', {'lease_id': _lease}, timeout=5)
+            if code != 200:
+                await _connect()
+        except (httpx2.HTTPError, ValueError, OSError, TypeError):
+            with suppress(Exception):
+                await _connect()
 
 
 @asynccontextmanager
 async def lifespan(server):
-    global _transport
-    _transport = await asyncio.to_thread(ensure_worker)
-    yield
-    # Deliberately leave the independently owned worker and Claude sessions running.
+    await _connect()
+    beat = asyncio.create_task(_heartbeat())
+    try:
+        yield
+    finally:
+        beat.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await beat
+        if _lease:
+            with suppress(Exception):
+                await _post('lease_release', {'lease_id': _lease}, timeout=3)
 
 
 server = MCPServer('claude_supervisor', version='0.1.0', lifespan=lifespan, instructions=(
@@ -28,18 +82,21 @@ server = MCPServer('claude_supervisor', version='0.1.0', lifespan=lifespan, inst
 
 
 async def call(method, args):
-    global _transport
     if _transport is None:
-        _transport = await asyncio.to_thread(ensure_worker)
-    async with httpx2.AsyncClient(trust_env=False, timeout=50) as client:
+        await _connect()
+    for attempt in (0, 1):
         try:
-            response = await client.post(f"http://127.0.0.1:{_transport['port']}/rpc",
-                headers={'Authorization':'Bearer '+_transport['secret']}, json={'method':method, 'args':args})
+            code, result = await _post(method, args, lease=_lease)
         except httpx2.ConnectError:
-            _transport = await asyncio.to_thread(ensure_worker)
-            response = await client.post(f"http://127.0.0.1:{_transport['port']}/rpc",
-                headers={'Authorization':'Bearer '+_transport['secret']}, json={'method':method, 'args':args})
-    result = response.json()
+            if attempt:
+                raise
+            await _connect()
+            continue
+        # Draining worker or lapsed lease: reconnect once (a drained worker's tasks need explicit resume).
+        if not attempt and (result.get('draining') or result.get('lease_required')):
+            await _connect()
+            continue
+        break
     if 'error' in result:
         raise ValueError(result['error'])
     return result['result']
@@ -70,7 +127,7 @@ async def task_start(prompt: str, workspace: str, model: str = 'claude-opus-5-5'
 
 @server.tool(annotations=WRITE)
 async def task_followup(task_id: str, text: str) -> dict:
-    """Send context or redirect; active turn is interrupted and drained first. Same Claude session."""
+    """Give Claude NEW instructions/context or redirect it (the only way to steer). Active turn is interrupted and drained first; same session."""
     return await call('followup', {'tid':task_id,'text':text})
 
 
@@ -97,7 +154,7 @@ async def task_request(task_id: str, request_id: str) -> dict:
 @server.tool(annotations=WRITE)
 async def task_answer(task_id: str, request_id: str, allow: bool = False,
                       answers: dict[str,str] | None = None, message: str = '') -> dict:
-    """Resolve one pending permission or question. answers maps exact question text to selected label/free text. Rejects stale IDs."""
+    """Resolve ONE specific pending permission/question by request_id; not for new instructions (use task_followup). answers maps exact question text to label/free text. message reaches Claude only as a denial reason; with allow=true it is not delivered. Rejects stale IDs."""
     return await call('answer', {'tid':task_id,'request_id':request_id,'allow':allow,'answers':answers,'message':message})
 
 

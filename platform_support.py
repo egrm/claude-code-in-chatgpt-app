@@ -99,6 +99,25 @@ def claude_cli():
     return path or default_claude_cli()
 
 
+def git_bash(windows=WINDOWS):
+    """Claude's Bash tool on Windows needs Git for Windows' bash.exe (never WSL's System32 bash)."""
+    if not windows:
+        found = shutil.which('bash')
+        return Path(found) if found else None
+    candidates = []
+    git = shutil.which('git')
+    if git:
+        candidates += [parent / 'bin' / 'bash.exe' for parent in list(Path(os.path.realpath(git)).parents)[:3]]
+    for base in (os.environ.get('ProgramFiles'), os.environ.get('ProgramW6432'), os.environ.get('LOCALAPPDATA')):
+        if base:
+            candidates += [Path(base) / 'Git' / 'bin' / 'bash.exe', Path(base) / 'Programs' / 'Git' / 'bin' / 'bash.exe']
+    system = os.path.normcase(os.path.join(os.environ.get('SystemRoot', r'C:\Windows'), 'System32'))
+    for candidate in candidates:
+        if candidate.is_file() and not os.path.normcase(str(candidate)).startswith(system):
+            return candidate
+    return None
+
+
 def codex_config_path(environ=None):
     environ = os.environ if environ is None else environ
     home = environ.get('CODEX_HOME')

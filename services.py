@@ -49,13 +49,24 @@ $task = Get-ScheduledTask -TaskName $env:CCS_TASK_NAME -ErrorAction SilentlyCont
 if (-not $task) { '{"exists":false}'; exit 0 }
 $actions = @($task.Actions)
 $first = if ($actions.Count -eq 1) { $actions[0] } else { $null }
-@{exists=$true; execute=[string]$first.Execute; arguments=[string]$first.Arguments;
-  working_directory=[string]$first.WorkingDirectory; state=[string]$task.State} | ConvertTo-Json -Compress
+@{exists=$true; execute=[string]$first.Execute; arguments=[string]$first.Arguments; actions=$actions.Count;
+  working_directory=[string]$first.WorkingDirectory; state=[string]$task.State;
+  triggers=@($task.Triggers | Where-Object { $_ }).Count; time_limit=[string]$task.Settings.ExecutionTimeLimit;
+  restart_count=[int]$task.Settings.RestartCount; multiple=[string]$task.Settings.MultipleInstances;
+  logon=[string]$task.Principal.LogonType; run_level=[string]$task.Principal.RunLevel} | ConvertTo-Json -Compress
 ''',
     # Same definition the original setup.ps1 registered: current user, interactive, limited,
     # no trigger (on demand only), no time limit, single instance.
     'create': r'''$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+$action = New-ScheduledTaskAction -Execute $env:CCS_WORKER -Argument $env:CCS_ARGS -WorkingDirectory $env:CCS_ROOT
+$principal = New-ScheduledTaskPrincipal -UserId $env:CCS_SID -LogonType Interactive -RunLevel Limited
+$settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
+Register-ScheduledTask -TaskName $env:CCS_TASK_NAME -Action $action -Principal $principal -Settings $settings -Description $env:CCS_DESCRIPTION | Out-Null
+''',
+    'recreate': r'''$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+Unregister-ScheduledTask -TaskName $env:CCS_TASK_NAME -Confirm:$false
 $action = New-ScheduledTaskAction -Execute $env:CCS_WORKER -Argument $env:CCS_ARGS -WorkingDirectory $env:CCS_ROOT
 $principal = New-ScheduledTaskPrincipal -UserId $env:CCS_SID -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -122,14 +133,30 @@ class WindowsTask:
             return 'legacy'
         return 'foreign'
 
+    @staticmethod
+    def drift(info):
+        """Departures from the on-demand definition: no trigger, no restart, no time limit, one instance."""
+        expected = {'actions': 1, 'triggers': 0, 'time_limit': 'PT0S', 'restart_count': 0, 'multiple': 'IgnoreNew',
+                    'logon': 'Interactive', 'run_level': 'Limited'}
+        return sorted(key for key, value in expected.items() if key in info and info[key] != value)
+
     def inspect(self):
         info = self._powershell('query')
-        return {'exists': bool(info.get('exists')), 'ownership': self.classify(info), 'state': info.get('state'), 'name': self.name}
+        return {'exists': bool(info.get('exists')), 'ownership': self.classify(info), 'state': info.get('state'),
+                'name': self.name, 'drift': self.drift(info) if info.get('exists') else []}
 
     def register(self):
-        ownership = self.classify(self._powershell('query'))
+        info = self._powershell('query')
+        ownership = self.classify(info)
         if ownership == 'foreign':
             raise ValueError(FOREIGN.format(self.name))
+        drift = self.drift(info) if ownership != 'absent' else []
+        if drift:
+            if info.get('state') == 'Running':
+                raise RuntimeError(f'Worker task {self.name} differs from the on-demand definition ({", ".join(drift)}) '
+                                   'but is running; stop its tasks and the worker, then rerun setup.py install')
+            self._powershell('recreate', CCS_SID=self.sid, CCS_DESCRIPTION=DESCRIPTION, **self._action_values())
+            return 'repaired'
         if ownership == 'owned':
             return 'unchanged'
         if ownership == 'legacy':
@@ -140,6 +167,10 @@ class WindowsTask:
         return 'created'
 
     def start(self):
+        ownership = self.classify(self._powershell('query'))
+        if ownership not in ('owned', 'legacy'):
+            raise ValueError(FOREIGN.format(self.name) if ownership == 'foreign'
+                             else f'Worker task {self.name} is not registered; rerun setup.py install')
         schtasks = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'schtasks.exe'
         result = self.run([schtasks, '/Run', '/TN', self.name], timeout=15)
         if result.returncode:
@@ -200,13 +231,27 @@ class LaunchAgent:
         if data is None:
             return 'absent'
         args = data.get('ProgramArguments') if isinstance(data, dict) else None
-        if (isinstance(args, list) and len(args) == 2 and same_path(args[1], self.root / 'daemon.py')
+        if (isinstance(args, list) and len(args) == 2 and data.get('Label') == self.label
+                and same_path(args[0], venv_python(self.root, windows=False)) and same_path(args[1], self.root / 'daemon.py')
                 and same_path(data.get('WorkingDirectory', ''), self.root)):
             return 'owned'
         return 'foreign'
 
     def loaded(self):
-        return self.run(['launchctl', 'print', self.target], timeout=15).returncode == 0
+        return self.loaded_ownership() != 'absent'
+
+    def loaded_ownership(self):
+        """Ownership of whatever launchd currently has loaded under this label (independent of disk)."""
+        result = self.run(['launchctl', 'print', self.target], timeout=15)
+        if result.returncode:
+            return 'absent'
+        shown = result.stdout or ''
+        paths = (venv_python(self.root, windows=False), self.root / 'daemon.py', self.root)
+        return 'owned' if all(f'{p}\n' in shown or f'{p} ' in shown or f'{p}"' in shown for p in paths) else 'foreign'
+
+    def _refuse_foreign(self):
+        if self.classify(self._existing()) == 'foreign' or self.loaded_ownership() == 'foreign':
+            raise ValueError(FOREIGN.format(self.target))
 
     def _bootstrap(self):
         result = self.run(['launchctl', 'bootstrap', self.domain, str(self.plist_path)], timeout=30)
@@ -215,18 +260,15 @@ class LaunchAgent:
 
     def inspect(self):
         data = self._existing()
-        state = None
-        if data is not None:
-            result = self.run(['launchctl', 'print', self.target], timeout=15)
-            state = 'not loaded'
-            if result.returncode == 0:
-                state = 'running' if 'state = running' in (result.stdout or '') else 'loaded'
-        return {'exists': data is not None, 'ownership': self.classify(data), 'state': state, 'name': self.label}
+        result = self.run(['launchctl', 'print', self.target], timeout=15)
+        loaded = self.loaded_ownership()
+        ownership = 'foreign' if loaded == 'foreign' else self.classify(data)
+        state = 'not loaded' if loaded == 'absent' else 'running' if 'state = running' in (result.stdout or '') else 'loaded'
+        return {'exists': data is not None or loaded != 'absent', 'ownership': ownership, 'state': state, 'name': self.label}
 
     def register(self):
         existing = self._existing()
-        if self.classify(existing) == 'foreign':
-            raise ValueError(FOREIGN.format(self.plist_path))
+        self._refuse_foreign()   # before any write/bootout: disk AND loaded job
         data = plistlib.dumps(self.definition())
         changed = existing is None or self.plist_path.read_bytes() != data
         if changed:
@@ -243,7 +285,12 @@ class LaunchAgent:
         return 'created' if existing is None else 'updated' if changed else 'unchanged'
 
     def start(self):
-        if not self.loaded():
+        if self.classify(self._existing()) != 'owned':
+            raise ValueError(FOREIGN.format(self.plist_path) + '; rerun setup.py install')
+        loaded = self.loaded_ownership()
+        if loaded == 'foreign':
+            raise ValueError(f'Loaded launchd job {self.label} does not run this checkout; rerun setup.py install')
+        if loaded == 'absent':
             self._bootstrap()
         result = self.run(['launchctl', 'kickstart', self.target], timeout=30)
         if result.returncode:
@@ -251,16 +298,15 @@ class LaunchAgent:
 
     def remove(self):
         existing = self._existing()
-        ownership = self.classify(existing)
-        if ownership == 'absent':
+        self._refuse_foreign()
+        if existing is None and not self.loaded():
             return 'absent'
-        if ownership == 'foreign':
-            raise ValueError(FOREIGN.format(self.plist_path))
         if self.loaded():
             result = self.run(['launchctl', 'bootout', self.target], timeout=30)
             if result.returncode:
                 raise _failure('launchctl bootout of the worker agent', result)
-        self.plist_path.unlink()
+        if existing is not None:
+            self.plist_path.unlink()
         return 'removed'
 
     def record(self):
@@ -311,10 +357,10 @@ class SystemdUserUnit:
     def classify(self, text):
         if text is None:
             return 'absent'
-        first = text.splitlines()[0] if text else ''
-        if first.startswith(self.marker) and same_path(first[len(self.marker):], self.root):
-            return 'owned'
-        return 'foreign'
+        keys = ('ExecStart=', 'WorkingDirectory=')
+        wanted = {line for line in self.definition().splitlines() if line.startswith(keys)}
+        found = {line.strip() for line in text.splitlines() if line.strip().startswith(keys)}
+        return 'owned' if found == wanted else 'foreign'
 
     def _systemctl(self, *args, check=True):
         result = self.run(['systemctl', '--user', *args], timeout=30)
@@ -322,17 +368,30 @@ class SystemdUserUnit:
             raise _failure('systemctl --user ' + ' '.join(args), result)
         return result
 
+    def loaded_ownership(self):
+        """Ownership of the unit systemd has loaded (may differ from disk until daemon-reload)."""
+        shown = self._systemctl('show', self.unit, '-p', 'LoadState', '-p', 'ExecStart', '-p', 'WorkingDirectory',
+                                check=False).stdout or ''
+        if not shown.strip() or 'LoadState=not-found' in shown.splitlines():
+            return 'absent'
+        return 'owned' if self.loaded_matches(shown) else 'foreign'
+
+    def _refuse_foreign(self):
+        if self.classify(self._existing()) == 'foreign' or self.loaded_ownership() == 'foreign':
+            raise ValueError(FOREIGN.format(self.unit_path))
+
     def inspect(self):
         text = self._existing()
+        loaded = self.loaded_ownership()
         state = None
-        if text is not None:
+        if text is not None or loaded != 'absent':
             state = (self._systemctl('is-active', self.unit, check=False).stdout or '').strip() or 'unknown'
-        return {'exists': text is not None, 'ownership': self.classify(text), 'state': state, 'name': self.unit}
+        ownership = 'foreign' if loaded == 'foreign' else self.classify(text)
+        return {'exists': text is not None or loaded != 'absent', 'ownership': ownership, 'state': state, 'name': self.unit}
 
     def register(self):
         existing = self._existing()
-        if self.classify(existing) == 'foreign':
-            raise ValueError(FOREIGN.format(self.unit_path))
+        self._refuse_foreign()   # before any write/daemon-reload: disk AND loaded unit
         text = self.definition()
         if existing == text:
             return 'unchanged'
@@ -342,16 +401,31 @@ class SystemdUserUnit:
         return 'created' if existing is None else 'updated'
 
     def start(self):
+        if self.classify(self._existing()) != 'owned':
+            raise ValueError(FOREIGN.format(self.unit_path) + '; rerun setup.py install')
+        if self.loaded_ownership() != 'owned':
+            raise ValueError(f'Loaded unit {self.unit} does not run this checkout; rerun setup.py install')
         self._systemctl('start', self.unit)
 
+    def loaded_matches(self, shown):
+        """`systemctl show` lines: exact WorkingDirectory, ExecStart path= interpreter and argv[] daemon."""
+        lines = shown.splitlines()
+        execs = [line for line in lines if line.startswith('ExecStart=')]
+        python, daemon = str(venv_python(self.root, windows=False)), str(self.root / 'daemon.py')
+        argv = (f'argv[]={python} {daemon} ;', f'argv[]="{python}" "{daemon}" ;')
+        return (f'WorkingDirectory={self.root}' in lines and len(execs) == 1 and f'path={python} ;' in execs[0]
+                and any(a in execs[0] for a in argv))
+
     def remove(self):
-        ownership = self.classify(self._existing())
-        if ownership == 'absent':
+        existing = self._existing()
+        self._refuse_foreign()   # before stop: never stop a foreign loaded unit
+        loaded = self.loaded_ownership()
+        if existing is None and loaded == 'absent':
             return 'absent'
-        if ownership == 'foreign':
-            raise ValueError(FOREIGN.format(self.unit_path))
-        self._systemctl('stop', self.unit, check=False)
-        self.unit_path.unlink()
+        if loaded == 'owned':
+            self._systemctl('stop', self.unit, check=False)
+        if existing is not None:
+            self.unit_path.unlink()
         self._systemctl('daemon-reload', check=False)
         return 'removed'
 

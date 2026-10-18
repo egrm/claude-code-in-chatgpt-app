@@ -133,6 +133,34 @@ def test_apply_refuses_concurrent_modification(tmp_path, monkeypatch):
     assert config.read_text() == 'a = 2\n'
 
 
+def test_remove_with_explicit_empty_parent_table():
+    original = 'a = 1\n\n[mcp_servers]\n'
+    configured = configure(original)
+    assert remove(configured) == original
+    assert tomllib.loads(remove(configured)) == {'a': 1, 'mcp_servers': {}}
+
+
+def test_missing_final_newline_is_normalized_once_and_then_stable():
+    configured = configure('a = 1')
+    assert remove(configured) == 'a = 1\n'
+    assert remove(configure('a = 1\n')) == 'a = 1\n'
+
+
+def test_apply_rechecks_original_bytes_immediately_before_replace(tmp_path, monkeypatch):
+    config = tmp_path/'config.toml'
+    config.write_text('a = 1\n')
+    real_fsync = reg.os.fsync
+    def racing_fsync(fd):
+        real_fsync(fd)
+        if not config.read_text().startswith('b'):
+            config.write_text('b = 2\n')
+    monkeypatch.setattr(reg.os, 'fsync', racing_fsync)
+    with pytest.raises(ValueError, match='changed'):
+        reg.apply(config, configure, tmp_path)
+    assert config.read_text() == 'b = 2\n'
+    assert not list(tmp_path.glob('.config.toml.*.tmp'))
+
+
 def test_apply_refuses_invalid_toml_untouched(tmp_path):
     config = tmp_path/'config.toml'
     config.write_bytes(b'[broken\n')

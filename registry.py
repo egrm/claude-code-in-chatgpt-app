@@ -17,6 +17,7 @@ class Registry:
         self.records = {r['task_id']: r for r in self.store.tasks()}
         self.backends, self.workers, self.commands, self.pending = {}, {}, {}, {}
         self.changed = asyncio.Event()
+        self.closing = False
         if backend_factory is None:
             from sdk_backend import ClaudeBackend
             backend_factory = ClaudeBackend
@@ -28,6 +29,10 @@ class Registry:
                 r['current_operation'] = None
                 r['pending_requests'] = []
                 self._event(r, 'recovered', {'state': 'interrupted'})
+
+    def _open(self):
+        if self.closing:
+            raise ValueError('Supervisor worker is shutting down; reconnect and resume tasks explicitly')
 
     def _record(self, task_id):
         if task_id not in self.records:
@@ -63,6 +68,7 @@ class Registry:
 
     async def start(self, prompt, workspace, model='claude-opus-5-5', effort='high', tools=None,
                     max_turns=30, max_budget_usd=1.0):
+        self._open()
         if not prompt.strip() or len(prompt) > 64000:
             raise ValueError('Provide a nonempty prompt of at most 64000 characters')
         root = Path(workspace).resolve(strict=True)
@@ -104,15 +110,25 @@ class Registry:
                                lambda kind, data: self.hook(tid, kind, data))
         try:
             await backend.connect()
+            if self.closing:
+                return   # shutdown began during connect (even if cancellation was swallowed): never send
             self.backends[tid] = backend
             r['current_operation'] = 'model'
             await backend.send(prompt)
             while True:
                 operation, text, reply = await self.commands[tid].get()
+                if self.closing:
+                    reply.set_exception(ValueError('Supervisor worker is shutting down'))
+                    break
                 try:
                     if operation in ('interrupt', 'followup') and r['state'] not in TERMINAL:
                         self._cancel_requests(tid)
                         await backend.interrupt()
+                        if self.closing:
+                            # Interrupt swallowed shutdown's cancellation: keep the persisted state, send nothing.
+                            if not reply.done():
+                                reply.set_exception(ValueError('Supervisor worker is shutting down'))
+                            break
                         r['state'] = 'interrupted'
                         r['current_operation'] = None
                         self._event(r, 'interrupted', {})
@@ -128,9 +144,10 @@ class Registry:
                         break
                     reply.set_result(True)
                 except Exception as exc:
-                    r.update(state='failed', error=str(exc)[:2000], current_operation=None)
+                    if not self.closing:
+                        r.update(state='failed', error=str(exc)[:2000], current_operation=None)
+                        self._event(r, 'failed', {'error': r['error']})
                     self._cancel_requests(tid)
-                    self._event(r, 'failed', {'error': r['error']})
                     if not reply.done():
                         reply.set_exception(exc)
         except asyncio.CancelledError:
@@ -139,8 +156,9 @@ class Registry:
                 self._event(r, 'interrupted', {'reason': 'supervisor shutdown'})
             raise
         except Exception as exc:
-            r.update(state='failed', error=str(exc)[:2000], current_operation=None)
-            self._event(r, 'failed', {'error': r['error']})
+            if not self.closing:   # drain already persisted the interrupted state and reason
+                r.update(state='failed', error=str(exc)[:2000], current_operation=None)
+                self._event(r, 'failed', {'error': r['error']})
         finally:
             self._cancel_requests(tid)
             self.backends.pop(tid, None)
@@ -155,6 +173,10 @@ class Registry:
 
     async def emit(self, tid, kind, data):
         r = self._record(tid)
+        if self.closing and kind in ('result', 'failed', 'disconnected', 'init'):
+            # Drain already persisted the final interrupted state; record late output only.
+            self._event(r, 'late_' + kind, {k: v for k, v in data.items() if k in ('error', 'is_error', 'interrupted')})
+            return
         if kind == 'init':
             r['session_id'] = data.get('session_id', r['session_id'])
             r['actual_model'] = data.get('model')
@@ -178,6 +200,8 @@ class Registry:
 
     async def hook(self, tid, kind, data):
         r = self._record(tid)
+        if self.closing and kind == 'tool_started':
+            return 'Supervisor worker is shutting down; no new tool actions'
         tool, inputs = data.get('tool_name'), data.get('tool_input', {})
         reason = check_file_scope(r['workspace'], tool, inputs) if kind == 'tool_started' else None
         if reason:
@@ -189,6 +213,8 @@ class Registry:
 
     async def request(self, tid, tool, data):
         r = self._record(tid)
+        if self.closing:
+            return {'allow': False, 'message': 'Supervisor worker is shutting down'}
         if len(json.dumps(data)) > 64000:
             return {'allow': False, 'message': 'Tool input exceeds 64000 characters; split the operation'}
         reason = check_file_scope(r['workspace'], tool, data)
@@ -219,6 +245,7 @@ class Registry:
         return next(p for p in r['pending_requests'] if p['request_id'] == request_id)
 
     async def answer(self, tid, request_id, allow=False, answers=None, message=''):
+        self._open()
         r = self._record(tid)
         pending = self.pending.get(request_id)
         if not pending or pending[0] != tid or pending[1].done():
@@ -234,7 +261,11 @@ class Registry:
         pending[1].set_result(result)
         self._event(r, 'answered', {'request_id': request_id, 'allow': result['allow']})
         await asyncio.sleep(0)
-        return self.status(tid)
+        status = self.status(tid)
+        if result['allow'] and message.strip() and request['tool'] != 'AskUserQuestion':
+            # The SDK delivers a message only with a denial; approvals do not steer Claude.
+            status['warning'] = 'message was not delivered to Claude on approval; use task_followup for new instructions'
+        return status
 
     def _cancel_requests(self, tid):
         for request_id, (owner, future) in list(self.pending.items()):
@@ -245,6 +276,8 @@ class Registry:
         self._record(tid)['pending_requests'] = []
 
     async def _command(self, tid, operation, text=None):
+        if operation != 'stop':
+            self._open()
         self._record(tid)
         if tid not in self.workers or self.workers[tid].done():
             raise ValueError('Backend is disconnected; use task_resume')
@@ -268,6 +301,7 @@ class Registry:
         return self.status(tid)
 
     async def resume(self, tid, prompt):
+        self._open()
         r = self._record(tid)
         if tid in self.workers and not self.workers[tid].done():
             if r['state'] != 'failed':
@@ -305,11 +339,28 @@ class Registry:
         r = self._record(tid)
         return {'task_id': tid, 'state': r['state'], 'result': r['result'], 'error': r['error'], 'session_id': r['session_id'], 'billing': r['billing']}
 
+    async def shutdown(self, reason='Supervisor worker stopped', timeout=8.0):
+        """Refuse new work, persist active tasks as interrupted, then close every Claude
+        connection concurrently within `timeout`. The daemon's process exit (Windows job /
+        POSIX group cleanup) terminates anything still unclosed."""
+        first = not self.closing
+        self.closing = True
+        interrupted = 0
+        if first:
+            for tid, r in self.records.items():
+                self._cancel_requests(tid)
+                if r['state'] not in TERMINAL:
+                    r.update(state='interrupted', current_operation=None,
+                             error=f'{reason}; resume the saved session explicitly')
+                    self._event(r, 'interrupted', {'reason': reason})
+                    interrupted += 1
+        live = [w for w in self.workers.values() if not w.done()]
+        for w in live:
+            w.cancel()
+        pending = set()
+        if live:
+            _, pending = await asyncio.wait(live, timeout=timeout)
+        return {'interrupted': interrupted, 'unclosed': len(pending)}
+
     async def close(self):
-        for tid in list(self.workers):
-            if not self.workers[tid].done():
-                try:
-                    await self.stop(tid)
-                except Exception:
-                    self.workers[tid].cancel()
-        await asyncio.gather(*self.workers.values(), return_exceptions=True)
+        await self.shutdown()

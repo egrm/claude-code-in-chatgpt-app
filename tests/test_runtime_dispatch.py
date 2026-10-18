@@ -43,7 +43,46 @@ def isolated_runtime(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, 'private_runtime', lambda: tmp_path)
     states = iter([False, True])
     monkeypatch.setattr(runtime, 'healthy', lambda info: next(states))
+    monkeypatch.setattr(runtime, 'probe', lambda info: None)
     return runtime, tmp_path
+
+
+def test_ensure_worker_waits_for_predecessor_worker_lock_before_launch(isolated_runtime, monkeypatch):
+    import threading
+    import platform_support as ps
+    runtime, folder = isolated_runtime
+    import services
+    held, release, events = threading.Event(), threading.Event(), []
+    def holder():
+        with ps.exclusive_lock(folder/'worker.lock', timeout=0):
+            held.set()
+            release.wait(5)
+            events.append('released')
+    thread = threading.Thread(target=holder)
+    thread.start()
+    held.wait(5)
+    threading.Timer(.5, release.set).start()
+    class Process:
+        def poll(self):
+            return None
+    monkeypatch.setattr(services, 'spawn_worker', lambda root, log: events.append('spawn') or Process())
+    runtime.ensure_worker()     # endpoint unresponsive (probe None) but lock still held
+    thread.join()
+    assert events == ['released', 'spawn']
+
+
+def test_ensure_worker_waits_for_draining_worker_before_restart(isolated_runtime, monkeypatch):
+    runtime, folder = isolated_runtime
+    import services
+    probes = iter([{'state': 'draining'}, {'state': 'draining'}, None])
+    order = []
+    monkeypatch.setattr(runtime, 'probe', lambda info: order.append('probe') or next(probes))
+    class Process:
+        def poll(self):
+            return None
+    monkeypatch.setattr(services, 'spawn_worker', lambda root, log: order.append('spawn') or Process())
+    runtime.ensure_worker()
+    assert order == ['probe', 'probe', 'probe', 'spawn']
 
 
 def test_ensure_worker_starts_legacy_windows_task_record(isolated_runtime, monkeypatch):

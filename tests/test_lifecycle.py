@@ -159,11 +159,95 @@ async def test_registry_shutdown_is_bounded_concurrent_and_persists_interrupted(
         await r.start('x', str(tmp_path), model='claude-haiku-5-5')
     with pytest.raises(ValueError, match='shutting down'):
         await r.resume(ids[0], 'x')
+    # Even auto-allowed read tools are refused, and late SDK results cannot overwrite the persisted state.
+    reason = await r.hook(ids[0], 'tool_started', {'tool_name': 'Read', 'tool_input': {'file_path': str(tmp_path/'a')}})
+    assert reason and 'shutting down' in reason
+    await r.emit(ids[1], 'result', {'result': 'late', 'is_error': False})
+    await r.emit(ids[2], 'failed', {'error': 'late failure'})
+    assert r.status(ids[1])['state'] == 'interrupted' and r.status(ids[2])['state'] == 'interrupted'
     recovered = Registry(tmp_path/'db', backend_factory=SlowBackend)
     for tid in ids:
         status = recovered.status(tid)
         assert status['state'] == 'interrupted' and 'clients disconnected' in status['error']
         assert status['pending_requests'] == []
+
+
+class ConnectingBackend:
+    """connect() blocks; on cancellation it either raises a transport error or swallows cancellation."""
+    mode = 'raise'
+    sent = []
+
+    def __init__(self, record, emit, permission, hook):
+        pass
+
+    async def connect(self):
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            if self.mode == 'raise':
+                raise RuntimeError('transport closed')
+            await asyncio.sleep(0)   # suppress cancellation and "succeed"
+
+    async def send(self, prompt):
+        ConnectingBackend.sent.append(prompt)
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('mode', ['raise', 'suppress'])
+async def test_shutdown_during_connect_keeps_interrupted_and_never_sends(tmp_path, mode):
+    from registry import Registry
+    ConnectingBackend.mode, ConnectingBackend.sent = mode, []
+    r = Registry(tmp_path/'db', backend_factory=ConnectingBackend)
+    tid = (await r.start('do work', str(tmp_path), model='claude-haiku-5-5'))['task_id']
+    await asyncio.sleep(.01)
+    await r.shutdown('All ChatGPT/MCP clients disconnected', timeout=1)
+    await asyncio.sleep(.01)
+    status = r.status(tid)
+    assert status['state'] == 'interrupted' and 'clients disconnected' in status['error']
+    assert ConnectingBackend.sent == [] and tid not in r.backends
+
+
+class SwallowingInterrupt:
+    entered = None
+    sent = []
+
+    def __init__(self, record, emit, permission, hook):
+        self.emit = emit
+
+    async def connect(self):
+        await self.emit('init', {'session_id': 's', 'model': 'claude-haiku-5-5'})
+
+    async def send(self, prompt):
+        SwallowingInterrupt.sent.append(prompt)
+
+    async def interrupt(self):
+        SwallowingInterrupt.entered.set()
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            return   # swallows cancellation
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_followup_after_swallowed_interrupt_never_sends_during_shutdown(tmp_path):
+    from registry import Registry
+    SwallowingInterrupt.entered, SwallowingInterrupt.sent = asyncio.Event(), []
+    r = Registry(tmp_path/'db', backend_factory=SwallowingInterrupt)
+    tid = (await r.start('first', str(tmp_path), model='claude-haiku-5-5'))['task_id']
+    await connected(r, tid)
+    followup = asyncio.create_task(r.followup(tid, 'new work'))
+    await asyncio.wait_for(SwallowingInterrupt.entered.wait(), 2)
+    await r.shutdown('All ChatGPT/MCP clients disconnected', timeout=1)
+    await asyncio.gather(followup, return_exceptions=True)
+    assert SwallowingInterrupt.sent == ['first']
+    status = r.status(tid)
+    assert status['state'] == 'interrupted' and 'clients disconnected' in status['error']
 
 
 @pytest.mark.asyncio

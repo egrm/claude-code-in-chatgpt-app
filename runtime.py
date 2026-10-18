@@ -36,19 +36,28 @@ def identity():
     return json.loads(path.read_text())
 
 
-def healthy(info):
+def probe(info):
+    """Authenticated health result of this installation's worker, or None if unreachable."""
     import httpx2
     try:
         r = httpx2.post(f"http://127.0.0.1:{info['port']}/rpc", headers={'Authorization':'Bearer '+info['secret']},
                         json={'method':'health','args':{}}, timeout=1, trust_env=False)
-        return r.status_code == 200 and r.json().get('result', {}).get('service') == 'claude-code-supervisor-v1'
+        result = r.json().get('result', {}) if r.status_code == 200 else {}
+        return result if result.get('service') == 'claude-code-supervisor-v1' else None
     except Exception:
-        return False
+        return None
+
+
+def healthy(info):
+    """Reachable and accepting work (pre-lease workers report no state)."""
+    status = probe(info)
+    return status is not None and status.get('state', 'running') == 'running'
 
 
 def ensure_worker():
     private_runtime()
-    with exclusive_lock(RUNTIME/'launcher.lock'):
+    # Longer than a draining predecessor's bounded exit (30 s) plus worker startup (15 s).
+    with exclusive_lock(RUNTIME/'launcher.lock', timeout=60):
         path = RUNTIME/'transport.json'
         if not path.exists():
             with socket.socket() as sock:
@@ -58,6 +67,21 @@ def ensure_worker():
         info = identity()
         if healthy(info):
             return info
+        # A draining worker still holds the port and worker lock: wait for its bounded exit.
+        end = time.monotonic()+30
+        while (status := probe(info)) is not None:
+            if status.get('state', 'running') == 'running':
+                return info
+            if time.monotonic() >= end:
+                raise TimeoutError('Previous supervisor worker is still shutting down; retry shortly')
+            time.sleep(.2)
+        # The listener closes before a predecessor's bounded teardown ends; launching while it still
+        # holds worker.lock would be ignored (IgnoreNew/active unit) or exit at once (detached).
+        try:
+            with exclusive_lock(RUNTIME/'worker.lock', timeout=max(1, end-time.monotonic())):
+                pass
+        except TimeoutError:
+            raise TimeoutError('Previous supervisor worker is still exiting; retry shortly') from None
         import services
         log = RUNTIME/'daemon.log'
         if log.exists() and log.stat().st_size > 2_000_000:

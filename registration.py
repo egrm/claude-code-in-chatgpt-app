@@ -2,7 +2,8 @@
 
 Stdlib only so it runs before the venv exists. Edits splice text, leaving every
 other byte unchanged, then prove the parsed result differs only as intended.
-Error messages never echo configuration values.
+Error messages never echo configuration values. A file lacking a final newline gains
+one when the entry is appended; removal then leaves that single newline (text-equivalent).
 """
 import codecs
 import copy
@@ -101,13 +102,18 @@ def _without_target(parsed):
     servers = value.get('mcp_servers')
     if isinstance(servers, dict):
         servers.pop(NAME, None)
-        if not servers:
-            value.pop('mcp_servers')
     return value
 
 
+def _normalized(parsed):
+    # An implicit parent vanishes with its last child; an explicit empty [mcp_servers] stays. Both are equivalent.
+    if parsed.get('mcp_servers') == {}:
+        parsed = {k: v for k, v in parsed.items() if k != 'mcp_servers'}
+    return parsed
+
+
 def _verify(result, expected):
-    if _parse(result) != expected:
+    if _normalized(_parse(result)) != _normalized(expected):
         raise ValueError('Refusing unexpected configuration changes; left unchanged')
     return result
 
@@ -210,6 +216,9 @@ def apply(config, transform, backup_dir):
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
+        # Last check immediately before the atomic swap (after backup and fsync).
+        if (config.read_bytes() if config.exists() else None) != (raw if existed else None):
+            raise ValueError('Host configuration changed during update; nothing written, rerun the command')
         os.replace(temporary, config)
     except BaseException:
         try:

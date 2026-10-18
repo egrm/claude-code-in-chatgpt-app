@@ -1,21 +1,14 @@
 # Verification — 2026-10-18
 
-- 25 automated tests passed at the standalone installation. Tests cover event retention/cursors/truncation/persistence, subscription-route guards, credential/search path boundaries, task lifecycle, permission/question round trips, stale answers, silence versus failure, disconnect cleanup, capacity during resume, authenticated RPC, compact polling, Windows child process containment/visibility, and configuration preservation.
-- Official SDK 0.2.168 around native Claude Code 2.1.302: Haiku 5.5 asked the expected clarification, paused before a write until approval, returned tool results, and completed. A second pending write was interrupted and remained absent; stale approval was refused. Disconnect/reconnect resumed the exact same session and retained the prior question/answer context.
-- Actual MCP stdio client negotiated protocol 2025-11-25 and discovered all 12 advertised tools. A task survived closing the first MCP client and reconnecting a second, then completed with the expected fixed response. A subsequent reconnect-only check used no inference.
-- Actual coding task through MCP: Haiku read a disposable arithmetic fixture, received approval only for its exact edit and `python check.py`, fixed it, and exposed the shell tool result. The coordinator independently ran the fixture test: exit code 0, stdout `FIXTURE_TEST_PASS`.
-- Subscription evidence reported Max claude.ai / firstParty, actual requested model, `isUsingOverage=false`, `overageStatus=rejected`, `overageDisabledReason=org_level_disabled`. No API-key/provider fallback was configured. CLI list-price estimates are not charges.
-- Opus 5.5/high supplied the event-store implementation as a bounded tool-free coding collaborator. Its actual model metadata and streaming arrival were verified; its output was reviewed and passed behavioral tests. Collaboration transcripts remain local and are excluded from Git.
-- Windows regression: identified the dedicated idle worker's console with title `claude`. Switched only its verified launcher to pythonw and added hidden subprocess policy. Replacement worker had no attached console; synchronous and asyncio child-console tests passed. No unrelated windows or active voice session were closed.
-- Host registration: `claude_supervisor`, project-local Python interpreter plus `server.py`, 30-second startup timeout and 60-second tool timeout. Existing config backed up privately; every unrelated parsed setting matched the original afterward. Original configuration text was preserved when repairing native CLI normalization of an unrelated empty args array.
-- A fresh read-only code review found three issues (recursive search access, dead connection slots, resume admission). Each received a failing regression test and fix; follow-up review found no important remaining issue in those changes.
+## Cross-platform installer and lifecycle (this release)
 
-## Desktop activation and remaining limits
+- Windows full suite: 102 passed, 3 skipped (POSIX-only), including real worker/facade process fixtures: abrupt client loss, startup without a client, graceful facade close, cancellation-resistant close (worker and owned child end within bound, task persisted `interrupted`).
+- Ubuntu full suite (independent run): 102 passed, 3 skipped, including external SIGTERM cleanup, draining reconnect/lock wait and registry shutdown races.
+- Windows real isolated install: fresh install; repeated install left config bytes and Task Scheduler XML exactly unchanged; `doctor` discovered 12 tools over real MCP; worker exited after the last client and its task returned to Ready; `remove` restored config exactly, deleted the task and kept task history.
+- Ubuntu real `systemd --user` fixture with spaces in the path: registered, started protocol-2 worker, MCP discovery 12 tools, exit and cleanup after the last client. Fresh bootstrap without ensurepip recovered via the system pip `--python` fallback; with native Claude absent it exited 2 with guidance, leaving config unchanged and registering no service.
+- Not performed: Linux desktop app, Linux Claude auth or inference, any macOS run (launchd adapter is mock-tested only). No app close/restart of the user's main installation.
 
-After the desktop app was restarted, the coordinator discovered the actual `claude_supervisor` tools and exercised task listing, a live Haiku task, an Opus 5.5/high task, results and stop. This app-level check was reported by the coordinating chat; no additional inference was run for the README update. A fresh-machine installation was not performed.
+## Earlier Windows release (still applicable)
 
-Automatic wake-up is not implemented: keep compact `task_wait` polling active while supervising. No native-agent roster integration or private reasoning access is claimed.
-
-Keep account usage credits disabled. Authentication preflight establishes the subscription route, while overage settings are observed from SDK rate-limit events rather than independently attested before the first model request.
-
-Raw event logs, authentication metadata, runtime transport capabilities, fixture code and configuration backups remain outside publication.
+- Official SDK 0.2.168 with native Claude Code 2.1.302: question/approval/interrupt/exact-session resume; Max claude.ai/firstParty, `isUsingOverage=false`. MCP stdio protocol 2025-11-25 discovered all 12 tools; coding fixture test exited 0. After an app restart the coordinator used Haiku 5.5 and Opus 5.5/high.
+- Raw logs, auth metadata, transport capabilities and config backups remain outside publication.

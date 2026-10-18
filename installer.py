@@ -56,18 +56,43 @@ def ensure_venv(ctx):
             raise SetupError('.venv exists but has no interpreter; inspect or move it aside, then rerun')
         say('..', 'Creating virtual environment', str(ctx.root / '.venv'))
         result = subprocess.run([sys.executable, '-m', 'venv', str(ctx.root / '.venv')], cwd=ctx.root)
-        if result.returncode:
-            raise SetupError('Virtual environment creation failed (on Debian/Ubuntu install the python3-venv package)')
+        if result.returncode and not ctx.python.exists():
+            # e.g. Debian without ensurepip: create without pip; pip_command() recovers or explains.
+            result = subprocess.run([sys.executable, '-m', 'venv', '--without-pip', str(ctx.root / '.venv')], cwd=ctx.root)
+        if not ctx.python.exists():
+            raise SetupError('Virtual environment creation failed (Debian/Ubuntu: sudo apt install python3-venv)')
     version = venv_run(ctx, 'import sys; print("%d.%d.%d" % sys.version_info[:3])').strip()
     if tuple(int(x) for x in version.split('.')[:2]) < ps.MIN_PYTHON:
         raise SetupError(f'.venv uses Python {version}; 3.11+ is required. Move .venv aside and rerun with a newer Python')
     say('ok', 'Virtual environment', f'Python {version}')
 
 
+def _works(command):
+    try:
+        return subprocess.run(command, capture_output=True, timeout=120, stdin=subprocess.DEVNULL,
+                              creationflags=ps.NO_WINDOW).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def pip_command(ctx):
+    """venv pip; else recover it with ensurepip; else the setup Python's pip targeting the venv."""
+    own = [str(ctx.python), '-m', 'pip']
+    if _works(own + ['--version']):
+        return own
+    if _works([str(ctx.python), '-m', 'ensurepip', '--upgrade', '--default-pip']) and _works(own + ['--version']):
+        return own
+    if _works([sys.executable, '-m', 'pip', '--version']):
+        return [sys.executable, '-m', 'pip', '--python', str(ctx.python)]
+    raise SetupError('pip is missing from .venv and ensurepip is unavailable. Install your Python\'s venv/pip support '
+                     '(Debian/Ubuntu: sudo apt install python3-venv python3-pip) or use a python.org/Homebrew Python, '
+                     'then move .venv aside and rerun')
+
+
 def install_requirements(ctx, dev=False):
     requirements = ctx.root / ('requirements-dev.txt' if dev else 'requirements.txt')
     say('..', 'Installing pinned dependencies', requirements.name)
-    result = subprocess.run([str(ctx.python), '-m', 'pip', 'install', '--disable-pip-version-check', '-q', '-r',
+    result = subprocess.run(pip_command(ctx) + ['install', '--disable-pip-version-check', '-q', '-r',
                              str(requirements)], cwd=ctx.root)
     if result.returncode:
         raise SetupError('Dependency installation failed; see pip output above')
@@ -151,6 +176,44 @@ def worker_rpc(ctx, method, args=None, timeout=5):
         raise SetupError(f'Worker refused {method}: {error or exc.code}') from None
     except (urllib.error.URLError, OSError, ValueError):
         return None
+
+
+def active_tasks(ctx):
+    """Confirmed active-task count (lower bound for pre-lease workers); None only if no worker answers."""
+    try:
+        counts = worker_rpc(ctx, 'admin_tasks')
+    except SetupError as exc:
+        if 'Unknown supervisor operation' not in str(exc):
+            raise
+        total = 0
+        for state in sorted(ACTIVE):   # pre-lease worker: Registry.list filters by state before limiting
+            rows = worker_rpc(ctx, 'list', {'state': state, 'limit': 100})
+            if not isinstance(rows, list):
+                raise SetupError('Older worker gave no task list; refusing to stop it')
+            total += len(rows)
+        return total
+    if counts is None:
+        return None
+    if not isinstance(counts, dict) or not isinstance(counts.get('active'), int):
+        raise SetupError('Worker task count unavailable; refusing to stop it')
+    return counts['active']
+
+
+def upgrade_worker(ctx):
+    """Stop an idle pre-lease worker so the current one starts; never interrupts active tasks."""
+    from lifecycle import PROTOCOL
+    health = worker_healthy(ctx)
+    if not health or health.get('protocol', 1) >= PROTOCOL:
+        return True
+    active = active_tasks(ctx)
+    if active is None or active > 0:
+        say('FAIL', 'Older worker', ('unreachable' if active is None else f'{active} active task(s)')
+            + '; left running. Finish/stop its tasks, then rerun install')
+        return False
+    worker_rpc(ctx, 'shutdown')
+    stopped = wait_worker_stopped(ctx, 30)
+    say('ok' if stopped else 'FAIL', 'Older idle worker', 'stopped for upgrade' if stopped else 'did not stop')
+    return stopped
 
 
 def worker_healthy(ctx):
@@ -266,18 +329,28 @@ def install(ctx, dev=False, configure=True):
               '  Max via claude.ai/firstParty only; API keys, providers and usage credits are not used.')
     else:
         say('ok', 'Claude authentication', show_auth(fields))
-    service = service_for(ctx)
+    if ps.WINDOWS and ps.git_bash() is None:
+        say('warn', 'Git Bash', 'not found; Claude\'s Bash tool needs Git for Windows (https://git-scm.com/downloads/win)')
+    service = preflight(ctx) if configure else service_for(ctx)
+    if not configure and service.inspect()['ownership'] == 'foreign':
+        raise ValueError(f'Worker launcher {service.kind} belongs to another installation')
+    if not upgrade_worker(ctx):
+        return 4
     outcome = service.register()
     ps.save_service_record(service.record(), ctx.runtime)
     say('ok', f'Worker launcher ({service.kind})', outcome + (f'; {service.note}' if getattr(service, 'note', None) else ''))
-    venv_run(ctx, 'from runtime import ensure_worker; ensure_worker()', timeout=60)
-    say('ok', 'Persistent worker is ready')
+    venv_run(ctx, 'from runtime import ensure_worker; ensure_worker()', timeout=90)
+    say('ok', 'Persistent worker is ready', 'on demand; it exits after the last MCP client leaves')
     if configure:
         changed = registration.apply(ctx.config, partial(registration.configure_text, root=ctx.root), ctx.runtime)
         say('ok', 'MCP entry claude_supervisor', ('registered' if changed else 'already registered') + f' in {ctx.config}')
     else:
         say('skip', 'MCP entry', 'not configured (--no-configure); run: python setup.py configure')
+    ok, detail = mcp_discovery(ctx)
+    say('ok' if ok else 'FAIL', 'MCP discovery (no inference)', detail)
     activation_instructions()
+    if not ok:
+        return 1
     if problem:
         print('\nSetup finished, but Claude Max authentication still needs attention (see above).')
         return 3
@@ -311,11 +384,17 @@ def doctor(ctx, mcp=True):
     if cli is None:
         check('FAIL', 'Native Claude Code', 'not found' + (' (' + '; '.join(notes) + ')' if notes else '') + f'; see {CLAUDE_SETUP}')
     else:
-        check('ok', 'Native Claude Code', f'{cli} ({claude_version(ctx, cli) or "version unavailable"})')
+        version = claude_version(ctx, cli)
+        check('ok' if version else 'FAIL', 'Native Claude Code', f'{cli} ({version or "--version failed"})')
         fields = auth_fields(ctx, cli)
         problem = auth_problem(fields)
         check('FAIL' if problem else 'ok', 'Claude Max authentication', show_auth(fields)
               + (f'; sign in: "{cli}" auth login --claudeai' if problem else ''))
+
+    if ps.WINDOWS:
+        bash = ps.git_bash()
+        check('ok' if bash else 'FAIL', 'Git Bash (Claude Bash tool)', str(bash) if bash else
+              'not found; install Git for Windows: https://git-scm.com/downloads/win')
 
     registered = False
     try:
@@ -328,7 +407,7 @@ def doctor(ctx, mcp=True):
         elif status['state'] == 'foreign':
             check('FAIL', 'MCP entry', registration.FOREIGN)
         elif not status['enabled']:
-            check('warn', 'MCP entry', 'owned but disabled in host settings')
+            check('FAIL', 'MCP entry', 'owned but disabled in host settings; enable it in the app')
         else:
             registered = True
             timeouts = ', '.join(f'{k}={status[k]}' for k in registration.TIMEOUTS)
@@ -367,29 +446,40 @@ def doctor(ctx, mcp=True):
     return 1 if failed else 0
 
 
+def preflight(ctx):
+    """Ownership of the MCP entry and launcher, checked before any mutation or worker stop."""
+    if registration.entry_status(read_config(ctx), ctx.root)['state'] == 'foreign':
+        raise ValueError(registration.FOREIGN)
+    service = service_for(ctx)
+    if service.inspect()['ownership'] == 'foreign':
+        raise ValueError(f'Worker launcher {service.kind} belongs to another installation')
+    return service
+
+
 def remove(ctx, force=False):
-    failures = 0
     try:
-        tasks = worker_rpc(ctx, 'list', {'limit': 100})
-    except SetupError as exc:
-        say('FAIL', 'Worker', str(exc))
+        service = preflight(ctx)
+        active = active_tasks(ctx)
+    except (ValueError, RuntimeError, OSError, UnicodeDecodeError, subprocess.SubprocessError) as exc:
+        say('FAIL', 'Remove preflight', (str(exc) if not isinstance(exc, (OSError, UnicodeDecodeError)) else
+            'host configuration unreadable')[:300] + '; nothing was changed')
         return 1
-    active = [t for t in tasks or [] if t.get('state') in ACTIVE]
     if active and not force:
-        say('FAIL', 'Active Claude tasks', f'{len(active)} task(s) running or waiting; stop them first or rerun with --force')
+        say('FAIL', 'Active Claude tasks', f'{active} task(s) running or waiting; stop them first or rerun with --force')
         return 1
+    failures = 0
     try:
         changed = registration.apply(ctx.config, partial(registration.remove_text, root=ctx.root), ctx.runtime)
         say('ok', 'MCP entry claude_supervisor', 'removed' if changed else 'not present')
     except (ValueError, OSError) as exc:
-        failures += 1
-        say('FAIL', 'MCP entry', str(exc) if isinstance(exc, ValueError) else 'host configuration unreadable; left unchanged')
-    if tasks is not None:
+        say('FAIL', 'MCP entry', (str(exc) if isinstance(exc, ValueError) else 'host configuration unreadable')
+            + '; worker and launcher left unchanged')
+        return 1
+    if active is not None:
         worker_rpc(ctx, 'shutdown')
         stopped = wait_worker_stopped(ctx)
         say('ok' if stopped else 'warn', 'Worker', 'stopped' if stopped else 'shutdown requested; still responding')
     try:
-        service = service_for(ctx)
         outcome = service.remove()
         ps.delete_service_record(ctx.runtime)
         say('ok', f'Worker launcher ({service.kind})', outcome)
