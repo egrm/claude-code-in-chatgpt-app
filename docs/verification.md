@@ -10,9 +10,11 @@
 - Host registration: `claude_supervisor`, project-local Python interpreter plus `server.py`, 30-second startup timeout and 60-second tool timeout. Existing config backed up privately; every unrelated parsed setting matched the original afterward. Original configuration text was preserved when repairing native CLI normalization of an unrelated empty args array.
 - A fresh read-only code review found three issues (recursive search access, dead connection slots, resume admission). Each received a failing regression test and fix; follow-up review found no important remaining issue in those changes.
 
-## Limits still requiring an app-level check
+## Desktop activation and remaining limits
 
-The current voice call was never restarted or ended. The bridge is registered and independently tested through real MCP, but the running coordinator's tool catalog may require refreshing that MCP server. Automatic wake-up is not implemented: keep compact `task_wait` polling active while supervising. No native-agent roster integration or private reasoning access is claimed.
+After the desktop app was restarted, the coordinator discovered the actual `claude_supervisor` tools and exercised task listing, a live Haiku task, an Opus 5.5/high task, results and stop. This app-level check was reported by the coordinating chat; no additional inference was run for the README update. A fresh-machine installation was not performed.
+
+Automatic wake-up is not implemented: keep compact `task_wait` polling active while supervising. No native-agent roster integration or private reasoning access is claimed.
 
 Keep account usage credits disabled. Authentication preflight establishes the subscription route, while overage settings are observed from SDK rate-limit events rather than independently attested before the first model request.
 
