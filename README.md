@@ -1,4 +1,6 @@
-# Claude Code Supervisor
+# Claude Code in ChatGPT App
+
+> **Work in progress:** This branch is an implementation checkpoint. The simplified cross-platform installer and close-with-app lifecycle are not yet release-verified. See [remaining work](docs/WORK-IN-PROGRESS.md). `main` remains the previous verified Windows implementation.
 
 Use Claude Code from a ChatGPT/Codex desktop conversation as a persistent, supervised coding agent. ChatGPT coordinates; Claude works in the local folder you choose. You can keep using the existing chat and its voice interface.
 
@@ -53,7 +55,7 @@ git --version
 $CodeFolder = Join-Path $env:USERPROFILE 'Code'
 New-Item -ItemType Directory -Path $CodeFolder -Force | Out-Null
 Set-Location $CodeFolder
-git clone https://github.com/egrm/claude-code-supervisor.git
+git clone https://github.com/egrm/claude-code-in-chatgpt-app.git
 $Project = Join-Path $CodeFolder 'claude-code-supervisor'
 Set-Location $Project
 ```

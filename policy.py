@@ -4,8 +4,12 @@ import os
 from pathlib import Path
 import subprocess
 
-CLI = Path.home() / '.local' / 'bin' / 'claude.exe'
+from platform_support import NO_WINDOW, claude_cli
+
+# Native Claude Code only: ~/.local/bin/claude(.exe), else the setup-recorded/PATH native binary.
+CLI = claude_cli()
 MODELS = {'claude-opus-5-5', 'claude-haiku-5-5'}
+AUTH_FIELDS = ('loggedIn', 'authMethod', 'apiProvider', 'subscriptionType')
 
 
 def clean_environment(source):
@@ -25,16 +29,26 @@ def validate_auth(status):
         raise ValueError('Claude Max claude.ai subscription authentication is required; API/provider routes refused')
 
 
-def preflight_auth():
-    command = [str(CLI), '--safe-mode', '--setting-sources', '', '--settings',
+def auth_status(cli=None):
+    """Clean-environment `auth status`; returns only the four non-secret routing fields."""
+    command = [str(cli or CLI), '--safe-mode', '--setting-sources', '', '--settings',
                '{"forceLoginMethod":"claudeai","fallbackModel":[],"fastMode":false}', 'auth', 'status', '--json']
-    r = subprocess.run(command, capture_output=True, text=True, timeout=20,
-                       env=clean_environment(os.environ), creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-    if r.returncode:
+    r = subprocess.run(command, capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL,
+                       env=clean_environment(os.environ), creationflags=NO_WINDOW)
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        data = None
+    # A failed status call is only reported (never accepted) when it says logged out.
+    if not isinstance(data, dict) or (r.returncode and data.get('loggedIn') is not False):
         raise ValueError('Claude subscription authentication status unavailable; no inference started')
-    data = json.loads(r.stdout)
+    return {k: data.get(k) for k in AUTH_FIELDS}
+
+
+def preflight_auth(cli=None):
+    data = auth_status(cli)
     validate_auth(data)
-    return {k: data.get(k) for k in ('loggedIn', 'authMethod', 'apiProvider', 'subscriptionType')}
+    return data
 
 
 def check_billing_event(info):

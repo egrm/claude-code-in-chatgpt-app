@@ -1,16 +1,13 @@
 """Private local transport identity, single worker ownership and hidden startup."""
-from contextlib import contextmanager
 import json
 import os
-from pathlib import Path
 import secrets
 import socket
-import subprocess
-import sys
 import time
 
-ROOT = Path(__file__).resolve().parent
-RUNTIME = ROOT / '.runtime'
+from platform_support import ROOT, RUNTIME, exclusive_lock, load_service_record, private_write
+
+__all__ = ['ROOT', 'RUNTIME', 'private_runtime', 'exclusive_lock', 'identity', 'healthy', 'ensure_worker']
 
 
 def private_runtime():
@@ -32,31 +29,6 @@ def private_runtime():
     else:
         RUNTIME.chmod(0o700)
     return RUNTIME
-
-
-@contextmanager
-def exclusive_lock(path, timeout=10):
-    import msvcrt
-    with open(path, 'a+b') as f:
-        f.seek(0, 2)
-        if not f.tell():
-            f.write(b'\0')
-            f.flush()
-        end = time.monotonic()+timeout
-        while True:
-            try:
-                f.seek(0)
-                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
-                break
-            except OSError:
-                if time.monotonic() >= end:
-                    raise TimeoutError('Another supervisor owns this local worker lock')
-                time.sleep(.1)
-        try:
-            yield
-        finally:
-            f.seek(0)
-            msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
 
 
 def identity():
@@ -82,30 +54,21 @@ def ensure_worker():
             with socket.socket() as sock:
                 sock.bind(('127.0.0.1', 0))
                 port = sock.getsockname()[1]
-            path.write_text(json.dumps({'port':port, 'secret':secrets.token_urlsafe(32)}))
+            private_write(path, json.dumps({'port':port, 'secret':secrets.token_urlsafe(32)}))
         info = identity()
         if healthy(info):
             return info
-        from policy import clean_environment
+        import services
         log = RUNTIME/'daemon.log'
         if log.exists() and log.stat().st_size > 2_000_000:
             log.write_text('')
-        scheduler = RUNTIME/'service-task.json'
-        process = None
-        if scheduler.exists():
-            task = json.loads(scheduler.read_text(encoding='utf-8-sig'))
-            if Path(task['root']).resolve() != ROOT:
-                raise ValueError('Scheduled worker belongs to another installation; rerun setup')
-            result = subprocess.run([str(Path(os.environ['SystemRoot'])/'System32'/'schtasks.exe'),
-                '/Run', '/TN', task['name']], capture_output=True, timeout=10,
-                creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
-            if result.returncode:
-                raise RuntimeError('Could not start the on-demand worker task; rerun setup.ps1')
+        record = load_service_record(RUNTIME)
+        if record is not None:
+            # Registered launcher (Windows task outside the MCP host's job, launchd, systemd, detached).
+            process = services.from_record(record, ROOT).start()
         else:
-            with log.open('ab') as output:
-                process = subprocess.Popen([sys.executable, str(ROOT/'daemon.py')], cwd=ROOT,
-                    stdin=subprocess.DEVNULL, stdout=output, stderr=output, env=clean_environment(os.environ),
-                    creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            # Development fallback without setup.
+            process = services.spawn_worker(ROOT, log)
         end = time.monotonic()+15
         while time.monotonic() < end:
             if healthy(info):
@@ -113,4 +76,4 @@ def ensure_worker():
             if process is not None and process.poll() is not None:
                 raise RuntimeError('Local Claude worker exited during startup; see .runtime/daemon.log')
             time.sleep(.2)
-        raise TimeoutError('Local Claude worker did not start within 15 seconds')
+        raise TimeoutError('Local Claude worker did not start within 15 seconds; run: python setup.py doctor')

@@ -77,6 +77,29 @@ def child_job():
     return job
 
 
+def posix_exit_on_sigterm():
+    # uvicorn restores this handler and re-raises SIGTERM after shutting down; exit
+    # through SystemExit so group cleanup below still runs.
+    import signal
+    def terminate(signum, frame):
+        raise SystemExit(128 + signum)
+    signal.signal(signal.SIGTERM, terminate)
+
+
+def posix_group_cleanup():
+    """Terminate remaining Claude/shell descendants, only when this worker leads its own group
+    (systemd/launchd service, or the detached session started by runtime.ensure_worker)."""
+    import signal
+    if os.name == 'nt' or os.getpgrp() != os.getpid():
+        return False
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        os.killpg(os.getpgrp(), signal.SIGTERM)
+    except OSError:
+        return False
+    return True
+
+
 if __name__ == '__main__':
     private_runtime()
     prepare_background_streams(RUNTIME/'daemon.log')
@@ -88,9 +111,15 @@ if __name__ == '__main__':
     hide_background_children()
     private_runtime()
     with exclusive_lock(RUNTIME/'worker.lock', timeout=0):
-        job = child_job()
+        if os.name == 'nt':
+            job = child_job()
+        else:
+            posix_exit_on_sigterm()
         info = identity()
         app = make_app(Registry(RUNTIME/'tasks.sqlite'), info['secret'])
         service = uvicorn.Server(uvicorn.Config(app, host='127.0.0.1', port=info['port'], log_level='warning', access_log=False))
         app.state.shutdown = lambda: setattr(service, 'should_exit', True)
-        service.run()
+        try:
+            service.run()
+        finally:
+            posix_group_cleanup()
